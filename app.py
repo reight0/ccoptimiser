@@ -1,3 +1,5 @@
+# --- START OF FULL MODIFIED FILE ---
+
 import streamlit as st
 import pandas as pd
 import numpy as np # For numerical operations, potentially handling NaN/inf
@@ -63,6 +65,7 @@ def load_data(filepath):
              if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
+        # Ensure BonusRewardCap is loaded as numeric
         numeric_cols = ['BonusSpendCap (Monthly $)', 'BonusRewardCap (Monthly $)',
                         'MinTotalSpendReq (Monthly $)', 'SpendThresholdX ($)',
                         'MinSpendCategoryValue ($)']
@@ -143,10 +146,16 @@ def calculate_potential_reward(card_details, user_spending, total_monthly_spend)
                 if category not in processed_bonus_categories: base_spend += spend
             potential_base_reward = base_spend * applicable_base_rate
     monthly_reward = potential_bonus_reward + potential_base_reward
+
+    # Apply Model 4 total reward cap for potential calculation as well
+    if model_type == 4:
+        reward_cap = card_details.get('BonusRewardCap (Monthly $)', float('inf'))
+        reward_cap = float('inf') if reward_cap == 0 else reward_cap
+        monthly_reward = min(monthly_reward, reward_cap) # Ensure potential doesn't exceed cap
+
     return monthly_reward
 
-# --- Optimal Allocation Logic using PuLP ---
-# [solve_optimal_allocation function remains the same - Snipped for brevity]
+
 # --- Optimal Allocation Logic using PuLP ---
 def solve_optimal_allocation(top_n_cards_df, user_spending_dict, total_monthly_spend):
     """ Solves for optimal spend allocation maximizing calculated reward using MIP. """
@@ -230,25 +239,58 @@ def solve_optimal_allocation(top_n_cards_df, user_spending_dict, total_monthly_s
                 prob += reward_vars[k][c] >= spend_vars[k][c] * applicable_base_rate, f"RewardLB_Base_{k}_{c}"
                 # Removed LB constraint: prob += reward_vars[k][c] >= spend_vars[k][c] * potential_bonus_rate - BIG_M * (1 - min_spend_met_vars[k]), f"RewardLB_BonusIfMinMet_{k}_{c}"
             elif not is_potential_bonus and not is_choice_option:
-                prob += reward_vars[k][c] == spend_vars[k][c] * applicable_base_rate, f"RewardEQ_Base_{k}_{c}"
+                # Reward for non-bonus categories OR Model 1 / Model 4 cards
+                # --- MODIFICATION START ---
+                # Check if it's Model 4 AND has a specific reward cap defined
+                if model_type == 4 and details.get('BonusRewardCap (Monthly $)', 0) > 0:
+                    # For capped Model 4, base reward is an UPPER BOUND,
+                    # allowing the TotalRewardCap_Model4 constraint to limit it if needed.
+                    prob += reward_vars[k][c] <= spend_vars[k][c] * applicable_base_rate, f"RewardUB_Base_IfModel4Cap_{k}_{c}"
+                    # Ensure reward is non-negative (already handled by variable definition lowBound=0)
+                    # The objective will push it towards the UB unless the total cap limits it.
+                else:
+                    # Original equality constraint for other models or Model 4 without a cap
+                    prob += reward_vars[k][c] == spend_vars[k][c] * applicable_base_rate, f"RewardEQ_Base_{k}_{c}"
+                # --- MODIFICATION END ---
 
     # Constraint 5: Bonus Spend Cap (Skip for Model 6)
     for k in card_names:
         details = card_details_dict[k]; spend_cap = details.get('BonusSpendCap (Monthly $)', 0)
         if spend_cap > 0:
+            # Apply spend cap only to cards with actual bonus categories or choice cards
+            # (Model 4's reward cap is handled separately below)
             if not details.get('IsChoiceCard', False): # Apply only if NOT choice card
                 bonus_spend_terms = []; effective_bonus_cats = set()
                 for i in range(1, MAX_BONUS_CATEGORIES + 1): cat = details.get(f'BonusCategory{i}', '');
                 if pd.notna(cat) and cat != '' and cat in categories and cat in card_bonus_categories[k]: effective_bonus_cats.add(cat)
                 if effective_bonus_cats: bonus_spend_terms.extend(spend_vars[k][c] for c in effective_bonus_cats)
                 if bonus_spend_terms: prob += pulp.lpSum(bonus_spend_terms) <= spend_cap, f"BonusSpendCap_{k}"
+            # Note: We might need to reconsider Spend Cap for Choice Cards if necessary later
 
-    # Constraint 6: Bonus Reward Cap
+    # Constraint 6: Bonus Reward Cap (for standard bonus/choice cards)
     for k in card_names:
         details = card_details_dict[k]; reward_cap = details.get('BonusRewardCap (Monthly $)', 0)
-        if reward_cap > 0:
+        model_type = details.get('RewardModelType', 0)
+        # Apply this cap only if it's NOT Model 4 (Model 4 cap handled separately below)
+        if model_type != 4 and reward_cap > 0:
             effective_bonus_cats = card_bonus_categories[k] # Use set populated earlier
-            if effective_bonus_cats: prob += pulp.lpSum(reward_vars[k][c] for c in effective_bonus_cats if c in categories) <= reward_cap, f"BonusRewardCap_{k}" # Ensure c is in categories
+            if effective_bonus_cats:
+                # Sum rewards ONLY from the defined bonus categories for this card
+                bonus_reward_terms = [reward_vars[k][c] for c in effective_bonus_cats if c in categories]
+                if bonus_reward_terms:
+                    prob += pulp.lpSum(bonus_reward_terms) <= reward_cap, f"BonusRewardCap_{k}"
+
+    # NEW Constraint: Total Reward Cap for Model 4 cards
+    for k in card_names:
+        details = card_details_dict[k]
+        model_type = details.get('RewardModelType', 0)
+        reward_cap = details.get('BonusRewardCap (Monthly $)', 0) # Read the cap value
+
+        if model_type == 4 and reward_cap > 0:
+            # Sum ALL reward variables for this card (since Model 4 reward is based on total spend)
+            total_reward_on_card_k = pulp.lpSum(reward_vars[k][c] for c in categories)
+            prob += total_reward_on_card_k <= reward_cap, f"TotalRewardCap_Model4_{k}"
+
 
     # Constraint 7: Model 6 Choice Limit
     for k in card_names:
@@ -290,10 +332,13 @@ card_data = load_data(DATA_FILE)
 # --- Add DEBUG print for loaded data ---
 if card_data is not None:
     print("\nDEBUG: Loaded Card Data (Relevant Rows):")
-    cards_to_print = ["UOB Lady's Card", "Live+ Card", "Lady's Card"] # Add variations if needed
-    relevant_cards_df = card_data[card_data['CardName'].isin(cards_to_print)]
-    if not relevant_cards_df.empty: print(relevant_cards_df.to_markdown(index=False))
-    else: print("Relevant cards not found in loaded data by specified names.")
+    # Example: Print cards that might be Model 4 or have specific caps for verification
+    # cards_to_print = ["CardName1", "CardName2"] # Replace with actual card names if needed
+    # relevant_cards_df = card_data[card_data['CardName'].isin(cards_to_print)]
+    # Or print cards with ModelType 4
+    relevant_cards_df = card_data[card_data['RewardModelType'] == 4]
+    if not relevant_cards_df.empty: print(relevant_cards_df[['CardName', 'RewardModelType', 'BaseRate (%)', 'SpendThresholdX ($)', 'BaseRateBelowX (%)', 'BonusRewardCap (Monthly $)']].to_markdown(index=False))
+    else: print("No Model 4 cards found in loaded data.")
 else: print("\nDEBUG: card_data is None after loading.")
 # --- End DEBUG print ---
 
@@ -303,9 +348,9 @@ if 'page' not in st.session_state: st.session_state.page = 'caveats'
 # --- Page Routing ---
 if st.session_state.page == 'caveats':
     # [Caveats page code remains the same - Snipped]
-    st.header("Dear Renee, your credit card strategy thing...."); st.markdown("strategy optimised based on hassle preference (number of cards), reward type preference, and spending habits.")
+    st.header("Dear Renee, your credit card strategy thing...."); st.markdown("'strategy' optimised based on hassle preference (number of cards), reward type preference, and spending habits.")
     st.write("---"); st.subheader("Some caveats and assumptions:")
-    st.markdown("""1. Draft / V1 version - please pay if you want me to further develop this.\n2. Considers only a list* of entry level (30k income requirement) CCs - please pay if you want me to further expand.\n3. Does not consider potential advantages from using certain bank accounts with CCs.\n4. Assumes you are spending with the relevant merchants required by the CCs for bonus rates under the categories.\n5. Does not consider annual fees, specific welcome offers/sign-up bonuses, points transfer bonuses to partners, conversion fees, ease of reward redemption, specific merchant discounts/perks, card design, or customer service quality…..also domestic spending only.\n6. Information based on quick and dirty desktop scan - could be wrong.""") # Removed '\*'
+    st.markdown("""1. Draft / V1 / prelim version - not to be taken seriously...\n2. Considers only a list* of entry level (30k income requirement) CCs.\n3. Does not consider potential advantages from using certain bank accounts with CCs.\n4. Assumes you are spending with the relevant merchants required by the CCs for bonus rates under the categories.\n5. Does not consider annual fees, specific welcome offers/sign-up bonuses, points transfer bonuses to partners, conversion fees, ease of reward redemption, specific merchant discounts/perks, card design, or customer service quality…..also domestic spending only.\n6. Information based on quick and dirty desktop scan - could be wrong.""") # Removed '\*'
     st.markdown("---"); st.subheader("*List of Credit Cards Considered in Database:")
     if card_data is not None and not card_data.empty:
         card_issuer_names = [];
@@ -348,40 +393,54 @@ elif st.session_state.page == 'optimiser':
             if num_cards_to_consider <= 0: st.warning("No eligible cards found.")
             else:
                 top_n_cards = ranked_cards_df.head(num_cards_to_consider).copy()
-                if top_n_cards.empty or top_n_cards['PotentialAnnualReward'].sum() <= 0.01 : st.warning("No suitable cards found.")
+                if top_n_cards.empty or top_n_cards['PotentialAnnualReward'].sum() <= 0.01 : st.warning("No suitable cards found based on initial ranking.") # Modified message
                 else:
                     st.subheader(f"Recommended Spending Allocation (Using up to {num_cards_to_consider} card(s)):")
                     try:
                         if not top_n_cards.empty:
                             allocation_details, card_monthly_rewards, card_details_dict_used, min_spend_met_final = solve_optimal_allocation( top_n_cards, user_spending_input, total_monthly_spend_input )
                             if not card_details_dict_used: pass # Error handled inside function
+                            elif not allocation_details and not card_monthly_rewards: st.warning("Solver ran but could not find a feasible or optimal allocation.") # Added check for empty results post-solve
                             else:
                                 total_annual_reward_allocated = sum(card_monthly_rewards.values()) * 12
-                                st.success(f"**Estimated Total Annual Reward from Strategy: ${total_annual_reward_allocated:,.2f}**")
+                                st.success(f"**Estimated Total Annual Reward from 'Strategy': ${total_annual_reward_allocated:,.2f}**")
                                 cards_used_in_strategy = [ name for name, allocations in allocation_details.items() if sum(data['spend'] for data in allocations.values()) > 0.01]
                                 num_cards_actually_used = len(cards_used_in_strategy)
-                                if num_cards_actually_used < num_cards_to_consider and num_cards_actually_used > 0 : st.info(f"Note: Optimal strategy found using {num_cards_actually_used} card(s), although up to {num_cards_to_consider} were considered.")
-                                elif num_cards_actually_used == 0: st.warning("Solver ran, but allocated no spending.")
+                                if num_cards_actually_used < num_cards_to_consider and num_cards_actually_used > 0 : st.info(f"Note: Optimal 'strategy' found using {num_cards_actually_used} card(s), although up to {num_cards_to_consider} were considered.")
+                                elif num_cards_actually_used == 0 and total_annual_reward_allocated < 0.01: st.warning("Solver ran, but allocated no spending resulting in $0 reward. Check card constraints and spending.") # More specific warning
+                                elif num_cards_actually_used == 0: st.warning("Solver ran, but allocated no spending. Review results.")
+
+
                                 st.write("---")
                                 card_rank = 0
-                                for i in range(num_cards_to_consider):
-                                    card_name = top_n_cards.iloc[i]['CardName']
-                                    if card_name in cards_used_in_strategy:
-                                        card_rank += 1; card_allocations = allocation_details.get(card_name, {}); card_annual_reward = card_monthly_rewards.get(card_name, 0) * 12; card_info = card_details_dict_used.get(card_name, {})
-                                        st.markdown(f"**{card_rank}. 💳 {card_name}** (Issuer: {card_info.get('Issuer', 'N/A')})"); st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;Est. Annual Reward from this card: **${card_annual_reward:,.2f}**")
-                                        min_req_final = card_info.get('MinTotalSpendReq (Monthly $)', 0); model_type_final = card_info.get('RewardModelType', 0); relies_on_min_final = model_type_final in [5, 7]
-                                        if relies_on_min_final and min_req_final > 0 and not min_spend_met_final.get(card_name, False) :
-                                            alloc_spend_val = sum(data['spend'] for data in card_allocations.values())
-                                            st.warning(f"&nbsp;&nbsp;&nbsp;&nbsp;**Note:** Optimal allocation resulted in spend (${alloc_spend_val:,.2f}/mo) below the ${min_req_final:,.0f} minimum. Bonus rates did not apply; rewards reflect base rate.", icon="ℹ️")
-                                        notes = card_info.get('Notes', '')
-                                        if notes and pd.notna(notes): st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;Notes: {notes}")
-                                        if card_allocations:
-                                            for category, data in sorted(card_allocations.items()):
-                                                if data['spend'] > 0.01:
-                                                    reward_str = f"{data['reward']:.2f}" if data['reward'] >= 0.01 else f"{data['reward']:.4f}"
-                                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;**{category}:** Spend per month - ${data['spend']:,.2f} (Return per month - ${reward_str})", unsafe_allow_html=True)
-                                        else: st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;*(No specific spend allocated to this card)*", unsafe_allow_html=True)
-                                        st.write("---")
+                                # Iterate through the cards that were actually USED in the strategy first
+                                sorted_used_cards = sorted(cards_used_in_strategy, key=lambda k: card_monthly_rewards.get(k, 0), reverse=True)
+
+                                for card_name in sorted_used_cards:
+                                    card_rank += 1
+                                    card_allocations = allocation_details.get(card_name, {})
+                                    card_annual_reward = card_monthly_rewards.get(card_name, 0) * 12
+                                    card_info = card_details_dict_used.get(card_name, {})
+                                    st.markdown(f"**{card_rank}. 💳 {card_name}** (Issuer: {card_info.get('Issuer', 'N/A')})")
+                                    st.markdown(f"    Est. Annual Reward from this card: **${card_annual_reward:,.2f}**")
+                                    min_req_final = card_info.get('MinTotalSpendReq (Monthly $)', 0); model_type_final = card_info.get('RewardModelType', 0); relies_on_min_final = model_type_final in [5, 7]
+                                    if relies_on_min_final and min_req_final > 0 and not min_spend_met_final.get(card_name, False) :
+                                        alloc_spend_val = sum(data['spend'] for data in card_allocations.values())
+                                        st.warning(f"    **Note:** Optimal allocation resulted in spend (${alloc_spend_val:,.2f}/mo) below the ${min_req_final:,.0f} minimum. Bonus rates did not apply; rewards reflect base rate.", icon="ℹ️")
+
+                                    # Check if reward was potentially capped for Model 4
+                                    if model_type_final == 4:
+                                        reward_cap_final = card_info.get('BonusRewardCap (Monthly $)', 0)
+
+                                    notes = card_info.get('Notes', '')
+                                    if notes and pd.notna(notes): st.caption(f"    Notes: {notes}")
+                                    if card_allocations:
+                                        for category, data in sorted(card_allocations.items()):
+                                            if data['spend'] > 0.01:
+                                                reward_str = f"{data['reward']:.2f}" if data['reward'] >= 0.01 else f"{data['reward']:.4f}"
+                                                st.markdown(f"    **{category}:** Spend per month - ${data['spend']:,.2f} (Return per month - ${reward_str})", unsafe_allow_html=True)
+                                    else: st.markdown("    *(No specific spend allocated to this card)*", unsafe_allow_html=True)
+                                    st.write("---")
                         else: st.warning("Top N cards list was empty.")
                     except pulp.PulpSolverError as plpe: st.error(f"PuLP Solver Error: {plpe}. Ensure PuLP/solver installed."); st.exception(plpe)
                     except Exception as e: st.error("An error occurred during optimal allocation."); st.exception(e)
@@ -389,3 +448,5 @@ elif st.session_state.page == 'optimiser':
 elif 'page' in st.session_state and st.session_state.page != 'caveats':
      st.error("Something went wrong with page navigation.");
      if st.button("Go back to Start"): st.session_state.page = 'caveats'; st.rerun()
+
+# --- END OF FILE ---
